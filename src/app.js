@@ -5,7 +5,7 @@ import morgan from 'morgan';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import compression from 'compression';
-
+import activityRoutes from './routes/activityRoutes.js';
 import { config } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { successResponse } from './utils/responseHandler.js';
@@ -28,6 +28,20 @@ import dealRoutes from './routes/dealRoutes.js';
 import publicRoutes from './routes/publicRoutes.js';
 
 const app = express();
+
+// ✅ Stop Express from sending 304 Not Modified for APIs
+app.disable('etag');
+
+// ✅ Prevent caching for all /api responses (avoids 304 + stale UI)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
+  next();
+});
 
 // ═══════════════════════════════════════════
 // SECURITY & PARSING MIDDLEWARE
@@ -93,6 +107,7 @@ app.use('/api/projects', projectRoutes);
 app.use('/api/holidays', holidayRoutes);
 
 app.use('/api/leads', leadRoutes);
+app.use('/api/activities', activityRoutes);
 app.use('/api/qualification', qualificationRoutes);
 app.use('/api/site-visit-scheduling', siteVisitRoutes);
 app.use('/api/site-visit-execution', siteVisitExecutionRoutes);

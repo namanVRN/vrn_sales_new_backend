@@ -9,6 +9,7 @@ import { logLeadCreation, logAutoAssignment } from '../services/activityService.
 import { reassignLead } from '../services/leadService.js';
 import { LEAD_STAGES, LEAD_STATUSES, LEAD_SOURCES } from '../config/constants.js';
 import logger from '../utils/logger.js';
+import { objectsToCsv } from '../utils/csvUtils.js';
 
 // ═══════════════════════════════════════════
 // POST /api/leads
@@ -26,7 +27,7 @@ export const createLead = async (req, res, next) => {
       lead_gen_number,
       lead_gen_name,
       campaign_name,
-      assigned_to,     // optional: manual assignment
+      assigned_to, // optional: manual assignment
       auto_assign = true,
     } = req.body;
 
@@ -40,18 +41,9 @@ export const createLead = async (req, res, next) => {
     }
 
     // Duplicate check
-    const isDuplicate = await isDuplicateLead(
-      customer_name, 
-      customer_contact, 
-      campaign_name || ''
-    );
-
+    const isDuplicate = await isDuplicateLead(customer_name, customer_contact, campaign_name || '');
     if (isDuplicate) {
-      return errorResponse(
-        res, 
-        'Duplicate lead: Same customer already exists for this campaign', 
-        400
-      );
+      return errorResponse(res, 'Duplicate lead: Same customer already exists for this campaign', 400);
     }
 
     // Generate unique ID
@@ -61,14 +53,12 @@ export const createLead = async (req, res, next) => {
     let ownerId = null;
 
     if (assigned_to) {
-      // Manual assignment
       const user = await User.findById(assigned_to);
       if (!user || user.role !== 'BDM') {
         return errorResponse(res, 'Invalid BDM user for assignment', 400);
       }
       ownerId = user._id;
     } else if (auto_assign) {
-      // Auto-assign to BDM
       ownerId = await autoAssignToBDM();
     }
 
@@ -94,19 +84,15 @@ export const createLead = async (req, res, next) => {
       original_timestamp: new Date(),
     });
 
-    // Log activity: lead creation
     await logLeadCreation(lead, req.user);
 
-    // Log activity: auto-assignment (if happened)
     if (ownerId && auto_assign) {
       await logAutoAssignment(lead, ownerId, req.user);
     }
 
     logger.success(`Lead created: ${uniqueId} - ${customer_name}`);
 
-    // Populate for response
-    const populatedLead = await Lead.findById(lead._id)
-      .populate('current_owner', 'name display_code role');
+    const populatedLead = await Lead.findById(lead._id).populate('current_owner', 'name display_code role');
 
     return successResponse(res, populatedLead, 'Lead created successfully', 201);
   } catch (error) {
@@ -117,7 +103,7 @@ export const createLead = async (req, res, next) => {
 
 // ═══════════════════════════════════════════
 // GET /api/leads
-// Get all leads with filters
+// Get all leads with filters (NOW supports today/overdue/date range)
 // ═══════════════════════════════════════════
 export const getAllLeads = async (req, res, next) => {
   try {
@@ -126,9 +112,16 @@ export const getAllLeads = async (req, res, next) => {
       status,
       owner,
       source,
+      project,
       is_cold,
       is_closed,
       search,
+
+      today,
+      overdue,
+      date_from,
+      date_to,
+
       page = 1,
       limit = 50,
     } = req.query;
@@ -139,8 +132,10 @@ export const getAllLeads = async (req, res, next) => {
     if (status) query.current_status = status;
     if (owner) query.current_owner = owner;
     if (source) query.lead_source = source;
-    if (is_cold !== undefined) query.is_cold = is_cold === 'true';
-    if (is_closed !== undefined) query.is_closed = is_closed === 'true';
+    if (project) query.project = project;
+
+    if (is_cold !== undefined && is_cold !== '') query.is_cold = is_cold === 'true';
+    if (is_closed !== undefined && is_closed !== '') query.is_closed = is_closed === 'true';
 
     if (search) {
       query.$or = [
@@ -150,14 +145,35 @@ export const getAllLeads = async (req, res, next) => {
       ];
     }
 
+    // Follow-up date filtering (today / overdue / date range)
+    if (overdue === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      query.next_followup_date = { $lt: start };
+    } else if (today === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      query.next_followup_date = { $gte: start, $lte: end };
+    } else if (date_from || date_to) {
+      query.next_followup_date = {};
+      if (date_from) query.next_followup_date.$gte = new Date(date_from);
+      if (date_to) {
+        const end = new Date(date_to);
+        end.setHours(23, 59, 59, 999);
+        query.next_followup_date.$lte = end;
+      }
+    }
+
     // Role-based filtering
-    // BDM sees only their assigned leads (except when admin)
+    // BDM sees only their assigned leads
     if (req.user.role === 'BDM') {
       query.current_owner = req.user.userId;
     }
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
 
     const total = await Lead.countDocuments(query);
 
@@ -168,14 +184,18 @@ export const getAllLeads = async (req, res, next) => {
       .skip((pageNum - 1) * limitNum)
       .limit(limitNum);
 
-    return successResponse(res, {
-      count: leads.length,
-      total,
-      page: pageNum,
-      limit: limitNum,
-      totalPages: Math.ceil(total / limitNum),
-      leads,
-    }, 'Leads fetched successfully');
+    return successResponse(
+      res,
+      {
+        count: leads.length,
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum),
+        leads,
+      },
+      'Leads fetched successfully'
+    );
   } catch (error) {
     next(error);
   }
@@ -197,7 +217,7 @@ export const getLeadById = async (req, res, next) => {
       return errorResponse(res, 'Lead not found', 404);
     }
 
-    // Role-based access
+    // Role-based access (current behavior)
     if (req.user.role === 'BDM' && lead.current_owner?._id.toString() !== req.user.userId.toString()) {
       return errorResponse(res, 'Access denied to this lead', 403);
     }
@@ -225,12 +245,16 @@ export const getLeadHistory = async (req, res, next) => {
       .populate('owner_after', 'name display_code')
       .sort({ createdAt: -1 });
 
-    return successResponse(res, {
-      lead_id: lead._id,
-      unique_id: lead.unique_id,
-      count: history.length,
-      history,
-    }, 'Lead history fetched');
+    return successResponse(
+      res,
+      {
+        lead_id: lead._id,
+        unique_id: lead.unique_id,
+        count: history.length,
+        history,
+      },
+      'Lead history fetched'
+    );
   } catch (error) {
     next(error);
   }
@@ -252,7 +276,6 @@ export const reassignLeadController = async (req, res, next) => {
       return errorResponse(res, 'Remark is required for reassignment', 400);
     }
 
-    // Verify new owner exists
     const newOwner = await User.findById(new_owner_id);
     if (!newOwner) {
       return errorResponse(res, 'New owner not found', 404);
@@ -289,19 +312,11 @@ export const getLeadStats = async (req, res, next) => {
   try {
     const baseQuery = {};
 
-    // BDM sees only own stats
     if (req.user.role === 'BDM') {
       baseQuery.current_owner = req.user.userId;
     }
 
-    const [
-      totalLeads,
-      activeLeads,
-      closedLeads,
-      coldLeads,
-      dealWon,
-      byStage,
-    ] = await Promise.all([
+    const [totalLeads, activeLeads, closedLeads, coldLeads, dealWon, byStage] = await Promise.all([
       Lead.countDocuments(baseQuery),
       Lead.countDocuments({ ...baseQuery, is_closed: false }),
       Lead.countDocuments({ ...baseQuery, is_closed: true }),
@@ -313,17 +328,21 @@ export const getLeadStats = async (req, res, next) => {
       ]),
     ]);
 
-    return successResponse(res, {
-      total: totalLeads,
-      active: activeLeads,
-      closed: closedLeads,
-      cold: coldLeads,
-      deal_won: dealWon,
-      by_stage: byStage.reduce((acc, item) => {
-        acc[item._id] = item.count;
-        return acc;
-      }, {}),
-    }, 'Stats fetched');
+    return successResponse(
+      res,
+      {
+        total: totalLeads,
+        active: activeLeads,
+        closed: closedLeads,
+        cold: coldLeads,
+        deal_won: dealWon,
+        by_stage: byStage.reduce((acc, item) => {
+          acc[item._id] = item.count;
+          return acc;
+        }, {}),
+      },
+      'Stats fetched'
+    );
   } catch (error) {
     next(error);
   }
@@ -353,7 +372,6 @@ export const getOverdueLeadsController = async (req, res, next) => {
       is_closed: false,
     };
 
-    // BDM sees only own
     if (req.user.role === 'BDM') {
       query.current_owner = req.user.userId;
     }
@@ -363,10 +381,7 @@ export const getOverdueLeadsController = async (req, res, next) => {
       .populate('project', 'name')
       .sort({ next_followup_date: 1 });
 
-    return successResponse(res, {
-      count: overdueLeads.length,
-      leads: overdueLeads,
-    }, 'Overdue leads fetched');
+    return successResponse(res, { count: overdueLeads.length, leads: overdueLeads }, 'Overdue leads fetched');
   } catch (error) {
     next(error);
   }
@@ -398,11 +413,273 @@ export const getTodaysFollowupsController = async (req, res, next) => {
       .populate('project', 'name')
       .sort({ next_followup_date: 1 });
 
-    return successResponse(res, {
-      count: leads.length,
-      leads,
-    }, "Today's followups fetched");
+    return successResponse(res, { count: leads.length, leads }, "Today's followups fetched");
   } catch (error) {
     next(error);
+  }
+};
+
+// ═══════════════════════════════════════════
+// GET /api/leads/owners
+// Owner dropdown list (read-only)
+// Allowed: ADMIN, PC, AUDITOR (route will enforce)
+// ═══════════════════════════════════════════
+export const getLeadOwnersController = async (req, res, next) => {
+  try {
+    // BDM + ADVISOR owners list for filtering
+    const owners = await User.find({
+      is_active: true,
+      role: { $in: ['BDM', 'ADVISOR'] },
+    })
+      .select('name role display_code email')
+      .sort({ role: 1, name: 1 })
+      .lean();
+
+    return successResponse(
+      res,
+      { count: owners.length, owners },
+      'Lead owners fetched'
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ═══════════════════════════════════════════
+// GET /api/leads/stats/monitor
+// Filter-aware card counts for Lead Monitor UI
+// ═══════════════════════════════════════════
+export const getLeadMonitorStatsController = async (req, res, next) => {
+  try {
+    const {
+      stage,
+      status,
+      owner,
+      source,
+      project,
+      is_cold,
+      is_closed,
+      search,
+      today,
+      overdue,
+      date_from,
+      date_to,
+    } = req.query;
+
+    const q = {};
+
+    if (stage) q.current_stage = stage;
+    if (status) q.current_status = status;
+    if (owner) q.current_owner = owner;
+    if (source) q.lead_source = source;
+    if (project) q.project = project;
+
+    if (is_cold !== undefined && is_cold !== '') q.is_cold = is_cold === 'true';
+    if (is_closed !== undefined && is_closed !== '') q.is_closed = is_closed === 'true';
+
+    if (search) {
+      q.$or = [
+        { unique_id: { $regex: search, $options: 'i' } },
+        { customer_name: { $regex: search, $options: 'i' } },
+        { customer_contact: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    // keep same restriction logic as list
+    if (req.user.role === 'BDM') {
+      q.current_owner = req.user.userId;
+    }
+
+    // apply the same follow-up filters if present
+    if (overdue === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      q.next_followup_date = { $lt: start };
+    } else if (today === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      q.next_followup_date = { $gte: start, $lte: end };
+    } else if (date_from || date_to) {
+      q.next_followup_date = {};
+      if (date_from) q.next_followup_date.$gte = new Date(date_from);
+      if (date_to) {
+        const end = new Date(date_to);
+        end.setHours(23, 59, 59, 999);
+        q.next_followup_date.$lte = end;
+      }
+    }
+
+    // compute these counts under the SAME filter context
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    const [total, cold, overdueCount, todayCount] = await Promise.all([
+      Lead.countDocuments(q),
+      Lead.countDocuments({ ...q, is_cold: true }),
+      Lead.countDocuments({ ...q, next_followup_date: { $lt: todayStart } }),
+      Lead.countDocuments({ ...q, next_followup_date: { $gte: todayStart, $lte: todayEnd } }),
+    ]);
+
+    return successResponse(res, { total, today: todayCount, overdue: overdueCount, cold }, 'Monitor stats fetched');
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ═══════════════════════════════════════════
+// GET /api/leads/export/csv  (ADMIN ONLY)
+// Export leads CSV with filters + "All Remarks" column
+// ═══════════════════════════════════════════
+export const exportLeadsCsvController = async (req, res, next) => {
+  try {
+    const {
+      stage,
+      status,
+      owner,
+      source,
+      project,
+      is_cold,
+      is_closed,
+      search,
+      today,
+      overdue,
+      date_from,
+      date_to,
+    } = req.query;
+
+    const query = {};
+
+    if (stage) query.current_stage = stage;
+    if (status) query.current_status = status;
+    if (owner) query.current_owner = owner;
+    if (source) query.lead_source = source;
+    if (project) query.project = project;
+
+    if (is_cold !== undefined && is_cold !== '') query.is_cold = is_cold === 'true';
+    if (is_closed !== undefined && is_closed !== '') query.is_closed = is_closed === 'true';
+
+    if (search) {
+      query.$or = [
+        { unique_id: { $regex: search, $options: 'i' } },
+        { customer_name: { $regex: search, $options: 'i' } },
+        { customer_contact: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    // Follow-up date filtering
+    if (overdue === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      query.next_followup_date = { $lt: start };
+    } else if (today === 'true') {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      const end = new Date();
+      end.setHours(23, 59, 59, 999);
+      query.next_followup_date = { $gte: start, $lte: end };
+    } else if (date_from || date_to) {
+      query.next_followup_date = {};
+      if (date_from) query.next_followup_date.$gte = new Date(date_from);
+      if (date_to) {
+        const end = new Date(date_to);
+        end.setHours(23, 59, 59, 999);
+        query.next_followup_date.$lte = end;
+      }
+    }
+
+    // NOTE: Admin export = no owner restriction here
+
+    // Safety cap to avoid huge exports accidentally
+    const MAX_EXPORT = 5000;
+
+    const leads = await Lead.find(query)
+      .populate('current_owner', 'name display_code role')
+      .populate('project', 'name code')
+      .sort({ createdAt: -1 })
+      .limit(MAX_EXPORT)
+      .lean();
+
+    const leadIds = leads.map(l => l._id);
+
+    // Fetch all remarks for these leads (use denormalized performer fields)
+    const activities = await LeadActivity.find({
+      lead: { $in: leadIds },
+      remark: { $exists: true, $ne: '' },
+    })
+      .select('lead remark createdAt performed_by_name performed_by_role action_type')
+      .sort({ createdAt: 1 })
+      .lean();
+
+    // Group remarks by leadId
+    const remarksMap = new Map();
+    for (const a of activities) {
+      const id = String(a.lead);
+      if (!remarksMap.has(id)) remarksMap.set(id, []);
+      remarksMap.get(id).push(a);
+    }
+
+    const rows = leads.map(l => {
+      const list = remarksMap.get(String(l._id)) || [];
+      const allRemarks = list
+        .map(r => {
+          const who = `${r.performed_by_name || '—'}${r.performed_by_role ? ` (${r.performed_by_role})` : ''}`;
+          const when = r.createdAt ? new Date(r.createdAt).toISOString() : '';
+          const act = r.action_type ? `[${r.action_type}]` : '';
+          return `${when} ${act} ${who}: ${r.remark}`;
+        })
+        .join('\n'); // multi-line cell in CSV
+
+      return {
+        unique_id: l.unique_id || '',
+        customer_name: l.customer_name || '',
+        customer_contact: l.customer_contact || '',
+        customer_email: l.customer_email || '',
+        interested_in: l.interested_in || '',
+        lead_source: l.lead_source || '',
+        campaign_name: l.campaign_name || '',
+        current_stage: l.current_stage || '',
+        current_status: l.current_status || '',
+        owner: l.current_owner?.name ? `${l.current_owner.name} (${l.current_owner.role || ''}${l.current_owner.display_code ? ` · ${l.current_owner.display_code}` : ''})` : '',
+        project: l.project?.name || '',
+        next_followup_date: l.next_followup_date ? new Date(l.next_followup_date).toISOString() : '',
+        is_cold: l.is_cold ? 'true' : 'false',
+        is_closed: l.is_closed ? 'true' : 'false',
+        createdAt: l.createdAt ? new Date(l.createdAt).toISOString() : '',
+        all_remarks: allRemarks,
+      };
+    });
+
+    const headers = [
+      { key: 'unique_id', label: 'Unique ID' },
+      { key: 'customer_name', label: 'Customer Name' },
+      { key: 'customer_contact', label: 'Customer Contact' },
+      { key: 'customer_email', label: 'Customer Email' },
+      { key: 'interested_in', label: 'Interested In' },
+      { key: 'lead_source', label: 'Lead Source' },
+      { key: 'campaign_name', label: 'Campaign' },
+      { key: 'current_stage', label: 'Stage' },
+      { key: 'current_status', label: 'Status' },
+      { key: 'owner', label: 'Owner' },
+      { key: 'project', label: 'Project' },
+      { key: 'next_followup_date', label: 'Next Follow-up (ISO)' },
+      { key: 'is_cold', label: 'Is Cold' },
+      { key: 'is_closed', label: 'Is Closed' },
+      { key: 'createdAt', label: 'Created At (ISO)' },
+      { key: 'all_remarks', label: 'All Remarks' },
+    ];
+
+    const csv = objectsToCsv(rows, headers);
+
+    const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="leads_export_${ts}.csv"`);
+
+    return res.status(200).send(csv);
+  } catch (err) {
+    next(err);
   }
 };
